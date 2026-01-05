@@ -260,6 +260,8 @@ function Save-Results {
     return $outputFile
 }
 
+# Korrigierte Upload-Funktion
+
 function Invoke-FileUpload {
     param(
         [string]$FilePath,
@@ -272,36 +274,108 @@ function Invoke-FileUpload {
         return $true
     }
     
+    if (-not (Test-Path $FilePath)) {
+        Write-Log "Datei nicht gefunden: $FilePath" -Level Error
+        return $false
+    }
+    
     try {
         Write-Log "Starte Upload nach: $TargetUrl" -Level Info
         
-        # Methode 1: WebClient (einfachste Methode)
-        $webClient = New-Object System.Net.WebClient
-        $webClient.UploadFile($TargetUrl, $FilePath)
+        # Methode 1: Invoke-RestMethod (empfohlen für PowerShell)
+        Write-Log "Verwende Invoke-RestMethod..." -Level Verbose
+        
+        $fileName = Split-Path $FilePath -Leaf
+        $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
+        
+        $uploadUri = if ($TargetUrl.EndsWith('/')) {
+            "${TargetUrl}${fileName}"
+        } else {
+            "${TargetUrl}/${fileName}"
+        }
+        
+        Invoke-RestMethod -Uri $uploadUri -Method Put -Body $fileBytes `
+            -ContentType "application/octet-stream" -ErrorAction Stop
         
         Write-Log "Upload erfolgreich!" -Level Success
         return $true
     }
     catch {
-        Write-Log "Upload fehlgeschlagen: $_" -Level Error
+        Write-Log "Invoke-RestMethod fehlgeschlagen: $_" -Level Error
         
-        # Methode 2: Invoke-RestMethod (Fallback)
+        # Methode 2: WebClient (Fallback)
         try {
-            Write-Log "Versuche alternative Methode..." -Level Warning
+            Write-Log "Versuche WebClient-Methode..." -Level Warning
             
-            $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
-            $fileName = Split-Path $FilePath -Leaf
+            $webClient = New-Object System.Net.WebClient
+            $webClient.UploadFile($uploadUri, $FilePath)
             
-            Invoke-RestMethod -Uri $TargetUrl -Method Post -InFile $FilePath `
-                -ContentType "application/octet-stream" `
-                -ErrorAction Stop
-            
-            Write-Log "Alternative Upload-Methode erfolgreich!" -Level Success
+            Write-Log "WebClient Upload erfolgreich!" -Level Success
             return $true
         }
         catch {
-            Write-Log "Alle Upload-Methoden fehlgeschlagen" -Level Error
-            return $false
+            Write-Log "WebClient fehlgeschlagen: $_" -Level Error
+            
+            # Methode 3: natives cURL falls verfügbar
+            try {
+                # Prüfe ob natives cURL (curl.exe) vorhanden ist
+                $nativeCurl = Get-Command "curl.exe" -ErrorAction SilentlyContinue
+                
+                if ($null -ne $nativeCurl) {
+                    Write-Log "Versuche natives cURL..." -Level Warning
+                    
+                    # Verwende curl.exe explizit mit vollständigem Pfad
+                    $curlArgs = @("-T", "`"$FilePath`"", "`"$uploadUri`"")
+                    Start-Process -FilePath $nativeCurl.Source -ArgumentList $curlArgs -Wait -NoNewWindow
+                    
+                    Write-Log "cURL Upload gestartet!" -Level Success
+                    return $true
+                }
+                else {
+                    Write-Log "cURL nicht verfügbar" -Level Verbose
+                }
+            }
+            catch {
+                Write-Log "cURL fehlgeschlagen: $_" -Level Error
+            }
+            
+            # Methode 4: Multipart Form-Data als letzter Versuch
+            try {
+                Write-Log "Versuche Multipart Form-Data..." -Level Warning
+                
+                $boundary = [System.Guid]::NewGuid().ToString()
+                $LF = "`r`n"
+                
+                $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
+                $enc = [System.Text.Encoding]::GetEncoding("iso-8859-1")
+                $fileContent = $enc.GetString($fileBytes)
+                
+                $bodyLines = @(
+                    "--$boundary",
+                    "Content-Disposition: form-data; name=`"file`"; filename=`"$fileName`"",
+                    "Content-Type: application/octet-stream",
+                    "",
+                    $fileContent,
+                    "--$boundary--"
+                )
+                
+                $body = $bodyLines -join $LF
+                
+                Invoke-RestMethod -Uri $TargetUrl -Method Post -Body $body `
+                    -ContentType "multipart/form-data; boundary=$boundary" -ErrorAction Stop
+                
+                Write-Log "Multipart Upload erfolgreich!" -Level Success
+                return $true
+            }
+            catch {
+                Write-Log "Alle Upload-Methoden fehlgeschlagen: $_" -Level Error
+                
+                # Manuellen Befehl anzeigen
+                Write-Log "`nManueller Upload-Befehl:" -Level Warning
+                Write-Log "curl.exe -T `"$FilePath`" `"$uploadUri`"" -Level Info
+                
+                return $false
+            }
         }
     }
 }
